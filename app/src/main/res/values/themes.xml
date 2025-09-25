@@ -1,0 +1,6 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+  <style name="Base.Theme.NarratorApp" parent="Theme.Material3.DayNight.NoActionBar">
+    </style>
+
+  <style name="Theme.NarratorApp" parent="Base.Theme.NarratorApp" />
+</resources>
