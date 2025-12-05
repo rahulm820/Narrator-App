@@ -41,7 +41,6 @@ class CombinedAnalyzer(
     private val scope = CoroutineScope(SupervisorJob())
     private val bitmapQueue = LinkedBlockingQueue<BitmapTask>(2)
     
-    // ===== FIXED: Separate flags for each processing type =====
     private val isDetectingObjects = AtomicBoolean(false)
     private val isOCRing = AtomicBoolean(false)
     private val isRecognizing = AtomicBoolean(false)
@@ -63,7 +62,6 @@ class CombinedAnalyzer(
     
     private var dimensionsInitialized = false
     
-    // ===== NEW: Last mode to detect changes =====
     private var lastMode: Mode = Mode.OBJECT_AND_TEXT
 
     enum class Mode {
@@ -77,10 +75,10 @@ class CombinedAnalyzer(
             if (field != value) {
                 Log.i("CombinedAnalyzer", "=== MODE CHANGED: ${field.name} → ${value.name} ===")
                 
-                // ===== CRITICAL: Clear all pending tasks when mode changes =====
+                // CRITICAL: Clear all pending tasks when mode changes
                 bitmapQueue.clear()
                 decisionEngine.reset()
-                // ===== Clear overlay based on new mode =====
+                
                 when (value) {
                     Mode.READING_ONLY -> {
                         // Clear objects, keep text
@@ -120,12 +118,6 @@ class CombinedAnalyzer(
                 dimensionsInitialized = true
             }
             
-            if (frameCount % 30 == 0) {
-                Log.i("CombinedAnalyzer", "=== FRAME STATS ===")
-                Log.i("CombinedAnalyzer", "Mode: ${mode.name}, Frames: $frameCount, Processed: $processedFrameCount")
-                Log.i("CombinedAnalyzer", "Rate: ${(processedFrameCount.toFloat() / frameCount * 100).toInt()}%")
-            }
-            
             if (now - lastAnalysisTime < analysisInterval) {
                 return
             }
@@ -139,11 +131,9 @@ class CombinedAnalyzer(
             val task = BitmapTask(bitmap, bitmap.width, bitmap.height, rotationDegrees)
             
             if (!bitmapQueue.offer(task)) {
-                Log.d("CombinedAnalyzer", "⚠️ Queue full, dropping frame")
                 return
             }
             
-            // ===== CRITICAL FIX: Route to correct processing based on mode =====
             when (mode) {
                 Mode.OBJECT_AND_TEXT -> processObjectsAndText()
                 Mode.READING_ONLY -> processTextOnly()
@@ -158,13 +148,10 @@ class CombinedAnalyzer(
         val task = bitmapQueue.poll() ?: return
         val bitmap = task.bitmap
         
-        // ===== FIXED: Use separate flag =====
         if (isDetectingObjects.compareAndSet(false, true)) {
             scope.launch(detectionDispatcher) {
                 try {
-                    // ===== CRITICAL: Check mode hasn't changed =====
                     if (mode != Mode.OBJECT_AND_TEXT) {
-                        Log.i("CombinedAnalyzer", "⚠️ Dropping object detection (Mode changed to ${mode.name})")
                         return@launch
                     }
                     
@@ -172,17 +159,8 @@ class CombinedAnalyzer(
                     val detections = objectDetector.detect(bitmap)
                     val detectionTime = System.currentTimeMillis() - startTime
                     
-                    // Double-check mode before processing results
                     if (mode != Mode.OBJECT_AND_TEXT) {
-                        Log.i("CombinedAnalyzer", "⚠️ Dropping object results (Mode changed)")
                         return@launch
-                    }
-                    
-                    Log.i("CombinedAnalyzer", "📦 DETECTIONS: ${detections.size} objects in ${detectionTime}ms")
-                    if (detections.isNotEmpty()) {
-                        detections.take(3).forEach { obj ->
-                            Log.i("CombinedAnalyzer", "  ✓ ${obj.label}: ${obj.confidencePercent()}")
-                        }
                     }
                     
                     val depthData = mutableMapOf<String, ObjectWithDepth>()
@@ -197,20 +175,18 @@ class CombinedAnalyzer(
                     navigationEngine?.processObstacles(detections)
                     
                     withContext(Dispatchers.Main) {
-                        // Triple-check mode before updating UI
                         if (mode == Mode.OBJECT_AND_TEXT) {
                             overlayView?.apply {
                                 objects = detections
-                                texts = emptyList()  // Clear any text
+                                texts = emptyList()
                                 postInvalidate()
                             }
-                            Log.d("CombinedAnalyzer", "✓ Overlay updated with ${detections.size} objects")
                         }
                     }
                     
                     if (mode == Mode.OBJECT_AND_TEXT) {
-                    decisionEngine.processWithDepth(depthData.values.toList())
-                }
+                        decisionEngine.processWithDepth(depthData.values.toList())
+                    }
                     
                 } catch (e: Exception) {
                     Log.e("CombinedAnalyzer", "Detection error", e)
@@ -220,7 +196,6 @@ class CombinedAnalyzer(
             }
         }
          
-        // Background face recognition (only in normal mode)
         if (memoryManager != null && frameCount % 10 == 0 && mode == Mode.OBJECT_AND_TEXT) {
             scope.launch(detectionDispatcher) {
                 val detections = overlayView?.objects ?: emptyList()
@@ -246,7 +221,6 @@ class CombinedAnalyzer(
         }
     }
 
-    // ===== FIXED: Reading mode only processes text =====
     private fun processTextOnly() {
         val task = bitmapQueue.poll() ?: return
         val bitmap = task.bitmap
@@ -254,37 +228,34 @@ class CombinedAnalyzer(
         if (isOCRing.compareAndSet(false, true)) {
             scope.launch(ocrDispatcher) {
                 try {
-                    // ===== CRITICAL: Check mode hasn't changed =====
                     if (mode != Mode.READING_ONLY) {
-                        Log.i("CombinedAnalyzer", "⚠️ Dropping OCR (Mode changed to ${mode.name})")
                         return@launch
                     }
                     
+                    // Note: Rotation passed to detectSync to handle orientation
                     val texts = ocrProcessor.detectSync(bitmap, rotationDegrees = task.rotationDegrees)
                     
-                    // Double-check mode
                     if (mode != Mode.READING_ONLY) {
-                        Log.i("CombinedAnalyzer", "⚠️ Dropping OCR results (Mode changed)")
                         return@launch
                     }
                     
-                    if (texts.isNotEmpty()) {
-                        Log.i("CombinedAnalyzer", "📖 READING MODE: ${texts.size} text blocks")
-                        
-                        withContext(Dispatchers.Main) {
-                            // Triple-check mode before updating UI
-                            if (mode == Mode.READING_ONLY) {
-                                overlayView?.apply {
-                                    this.objects = emptyList()  // NO objects in reading mode
-                                    this.texts = texts
-                                    postInvalidate()
-                                }
+                    // ===== FIXED: Update overlay even if list is empty =====
+                    // This ensures objects are cleared and "empty" state is shown
+                    withContext(Dispatchers.Main) {
+                        if (mode == Mode.READING_ONLY) {
+                            overlayView?.apply {
+                                this.objects = emptyList()
+                                this.texts = texts
+                                postInvalidate()
                             }
                         }
-                        
-                        // ===== FIXED: Only pass texts, no objects =====
+                    }
+                    
+                    // Only process decision engine if we have text, otherwise it's quiet
+                    if (texts.isNotEmpty()) {
                         decisionEngine.process(emptyList(), texts)
                     }
+                    
                 } catch (e: Exception) {
                     Log.e("CombinedAnalyzer", "OCR error", e)
                 } finally {
@@ -294,7 +265,6 @@ class CombinedAnalyzer(
         }
     }
     
-    // ===== FIXED: Recognition mode only does face/place recognition =====
     private fun processRecognition() {
         val task = bitmapQueue.poll() ?: return
         val bitmap = task.bitmap
@@ -303,17 +273,13 @@ class CombinedAnalyzer(
         
         val now = System.currentTimeMillis()
         
-        // ===== FIXED: Use separate flag =====
         if (isRecognizing.compareAndSet(false, true)) {
             scope.launch(detectionDispatcher) {
                 try {
-                    // Check mode
                     if (mode != Mode.RECOGNITION_MODE) {
-                        Log.i("CombinedAnalyzer", "⚠️ Dropping recognition (Mode changed)")
                         return@launch
                     }
                     
-                    // Face recognition
                     if (now - lastFaceRecognitionTime > faceRecognitionCooldown) {
                         val faces = faceDetector.detectFaces(bitmap)
                         if (faces.isNotEmpty() && mode == Mode.RECOGNITION_MODE) {
@@ -329,7 +295,6 @@ class CombinedAnalyzer(
                         }
                     }
                     
-                    // Place recognition
                     if (now - lastPlaceRecognitionTime > placeRecognitionCooldown && mode == Mode.RECOGNITION_MODE) {
                         val result = memoryManager.recognizePlace(bitmap)
                         if (result != null) {
@@ -370,7 +335,6 @@ class CombinedAnalyzer(
         }
     }
     
-    // ===== NEW: Get DecisionEngine reference for coordination =====
     fun getDecisionEngine(): DecisionEngine = decisionEngine
     
     fun cleanup() {

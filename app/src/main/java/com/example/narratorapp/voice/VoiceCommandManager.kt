@@ -176,15 +176,29 @@ class VoiceCommandManager(
                 consecutiveErrors = 0 // Reset after timeout
             }
         }
+        val silenceTimeout = if (isHotwordMode) {
+            5000L  // 5 seconds for hotword (you need time to notice and speak)
+        } else {
+            3000L  // 3 seconds for commands (user is already engaged)
+        }
         
+        val possibleSilenceTimeout = if (isHotwordMode) {
+            4000L  // 4 seconds before considering speech might be done
+        } else {
+            2000L  // 2 seconds for commands
+        }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, silenceTimeout)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, possibleSilenceTimeout)
+            if (isHotwordMode) {
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1000L)
+            }
         }
+        
         
         isListening = true
         

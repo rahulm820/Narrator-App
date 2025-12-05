@@ -62,7 +62,10 @@ class MainActivity : ComponentActivity() {
 
     private var voiceCommandService: VoiceCommandService? = null
     private var serviceBound = false
-    private var combinedAnalyzer: CombinedAnalyzer? = null
+
+    // Dynamic property to safely access analyzer
+    private val combinedAnalyzer: CombinedAnalyzer?
+        get() = if (::cameraXManager.isInitialized) cameraXManager.getAnalyzer() else null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -74,20 +77,30 @@ class MainActivity : ComponentActivity() {
                 handleVoiceCommand(command)
             }
             
-            // ===== NEW: Listen for hotword mode changes to coordinate with DecisionEngine =====
             voiceCommandService?.setHotwordModeCallback { isHotwordMode ->
                 combinedAnalyzer?.getDecisionEngine()?.setVoiceListeningState(isHotwordMode)
                 
                 runOnUiThread {
                     if (isHotwordMode) {
-                        voiceIndicator.setImageResource(android.R.drawable.ic_btn_speak_now)
+                        voiceIndicator.setImageResource(android.R.drawable.ic_menu_edit)
+                        voiceIndicator.alpha = 0.5f 
                     } else {
-                        voiceIndicator.setImageResource(android.R.drawable.ic_menu_edit)  // Different icon for command mode
+                        voiceIndicator.setImageResource(android.R.drawable.ic_btn_speak_now)
+                        voiceIndicator.alpha = 1.0f
                     }
                 }
             }
             
             Log.d("MainActivity", "Voice command service connected")
+
+            // Auto-start "How may I help you"
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (serviceBound) {
+                    voiceCommandService?.startListening(startWithHotword = false)
+                    ttsManager.speak("How may I help you?", TTSManager.Priority.HIGH)
+                    statusText.text = "How may I help you?"
+                }
+            }, 1000)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -184,7 +197,6 @@ class MainActivity : ComponentActivity() {
                 ttsManager.speak("No objects currently detected")
                 statusText.text = "No objects detected"
             } else {
-                // ===== FIXED: Request scene description through DecisionEngine =====
                 combinedAnalyzer?.getDecisionEngine()?.requestSceneDescription()
             }
         }
@@ -230,7 +242,6 @@ class MainActivity : ComponentActivity() {
         )
         
         cameraXManager.start()
-        combinedAnalyzer = cameraXManager.getAnalyzer()
     }
 
     private fun startVoiceCommandService() {
@@ -263,8 +274,10 @@ class MainActivity : ComponentActivity() {
                     if (waypoint != null) {
                         ttsManager.speak("Waypoint recorded")
                     } else {
-                        ttsManager.speak("Failed to record waypoint")
+                        ttsManager.speak("Failed to record waypoint. GPS or AR not ready.")
                     }
+                } else {
+                    ttsManager.speak("Navigation not ready")
                 }
             }
 
@@ -350,11 +363,19 @@ class MainActivity : ComponentActivity() {
             .setItems(arrayOf("Record Waypoint", "Start Navigation", "Stop Navigation")) { _, which ->
                 when (which) {
                     0 -> {
+                        // ===== FIXED: Added feedback/error handling =====
                         if (::navigationEngine.isInitialized) {
                             val waypoint = navigationEngine.recordWaypoint("Manual Waypoint")
                             if (waypoint != null) {
                                 Toast.makeText(this, "Waypoint recorded", Toast.LENGTH_SHORT).show()
+                                ttsManager.speak("Waypoint recorded")
+                            } else {
+                                Toast.makeText(this, "Failed: GPS or AR not tracking", Toast.LENGTH_LONG).show()
+                                ttsManager.speak("Could not record. Check GPS or move camera.")
                             }
+                        } else {
+                            Toast.makeText(this, "Navigation Engine not initialized", Toast.LENGTH_LONG).show()
+                            ttsManager.speak("Navigation not ready")
                         }
                     }
                     1 -> ttsManager.speak("Please create a route first")
@@ -385,7 +406,8 @@ class MainActivity : ComponentActivity() {
         ttsManager.speak("Please say the person's name now", TTSManager.Priority.HIGH)
         
         voiceInputHandler.postDelayed({
-            startVoiceCapture { spokenName ->
+            // Face name: 2 seconds timeout (default)
+            startVoiceCapture(silenceTimeout = 2000L) { spokenName ->
                 val cleanName = spokenName.trim()
                 
                 if (cleanName.isEmpty()) {
@@ -396,7 +418,7 @@ class MainActivity : ComponentActivity() {
                 ttsManager.speak("I heard: $cleanName. Say confirm to save, retry to try again, or cancel")
                 
                 voiceInputHandler.postDelayed({
-                    startVoiceCapture { response ->
+                    startVoiceCapture(silenceTimeout = 2000L) { response ->
                         when (response.lowercase().replace(" ", "")) {
                             "confirm" -> {
                                 captureFaceForLearning(cleanName)
@@ -421,7 +443,8 @@ class MainActivity : ComponentActivity() {
         ttsManager.speak("Please say the place name now", TTSManager.Priority.HIGH)
         
         voiceInputHandler.postDelayed({
-            startVoiceCapture { spokenName ->
+            // ===== FIXED: Increased timeout to 5 seconds for places =====
+            startVoiceCapture(silenceTimeout = 5000L) { spokenName ->
                 val cleanName = spokenName.trim()
                 
                 if (cleanName.isEmpty()) {
@@ -432,7 +455,7 @@ class MainActivity : ComponentActivity() {
                 ttsManager.speak("I heard: $cleanName. Say confirm to save, retry to try again, or cancel")
                 
                 voiceInputHandler.postDelayed({
-                    startVoiceCapture { response ->
+                    startVoiceCapture(silenceTimeout = 2000L) { response ->
                         when (response.lowercase().replace(" ", "")) {
                             "confirm" -> {
                                 capturePlaceForLearning(cleanName)
@@ -453,7 +476,8 @@ class MainActivity : ComponentActivity() {
         }, 2000)
     }
 
-    private fun startVoiceCapture(onResult: (String) -> Unit) {
+    // ===== FIXED: Added silenceTimeout parameter =====
+    private fun startVoiceCapture(silenceTimeout: Long = 2000L, onResult: (String) -> Unit) {
         voiceCommandService?.stopListening()
         
         voiceInputCallback = onResult
@@ -462,8 +486,9 @@ class MainActivity : ComponentActivity() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+            // Use the timeout parameter here
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, silenceTimeout)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, silenceTimeout)
         }
         
         voiceInputRecognizer?.destroy()
@@ -608,7 +633,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun describeCurrentScene() {
-        // ===== FIXED: Use DecisionEngine's requestSceneDescription =====
         combinedAnalyzer?.getDecisionEngine()?.requestSceneDescription()
     }
 
