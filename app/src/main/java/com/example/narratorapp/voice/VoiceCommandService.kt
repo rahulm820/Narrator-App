@@ -11,6 +11,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.narratorapp.R
 import com.example.narratorapp.narration.TTSManager
+import android.os.Handler
+import android.os.Looper
 
 class VoiceCommandService : Service() {
     
@@ -19,7 +21,19 @@ class VoiceCommandService : Service() {
     private lateinit var ttsManager: TTSManager
     
     private var commandCallback: ((VoiceCommand) -> Unit)? = null
+    private var hotwordModeCallback: ((Boolean) -> Unit)? = null  // NEW: Callback for hotword mode changes
     
+    private val watchdogHandler = Handler(Looper.getMainLooper())
+private val watchdogRunnable = object : Runnable {
+    override fun run() {
+        if (!voiceCommandManager.isCurrentlyListening()) {
+            Log.w("VoiceCommandService", "Watchdog: Restarting listener...")
+            startListening()
+        }
+        watchdogHandler.postDelayed(this, 5000) // Check every 5 seconds
+    }
+}
+
     companion object {
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "VoiceCommandChannel"
@@ -53,10 +67,8 @@ class VoiceCommandService : Service() {
         super.onCreate()
         Log.d("VoiceCommandService", "Service created")
         
-        // Create notification channel FIRST
         createNotificationChannel()
         
-        // Start foreground IMMEDIATELY (Android 12+ requirement)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
@@ -74,7 +86,6 @@ class VoiceCommandService : Service() {
             return
         }
         
-        // Initialize components AFTER foreground is established
         ttsManager = TTSManager(this)
         voiceCommandManager = VoiceCommandManager(this, ttsManager)
         
@@ -82,6 +93,14 @@ class VoiceCommandService : Service() {
             Log.d("VoiceCommandService", "Command recognized: ${command.getDescription()}")
             commandCallback?.invoke(command)
         }
+        
+        // ===== NEW: Forward hotword mode changes to MainActivity =====
+        voiceCommandManager.setOnHotwordModeChangedListener { isHotwordMode ->
+            Log.d("VoiceCommandService", "Hotword mode changed: $isHotwordMode")
+            hotwordModeCallback?.invoke(isHotwordMode)
+        }
+
+        watchdogHandler.post(watchdogRunnable)
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -123,6 +142,11 @@ class VoiceCommandService : Service() {
         commandCallback = callback
     }
     
+    // ===== NEW: Set callback for hotword mode changes =====
+    fun setHotwordModeCallback(callback: (Boolean) -> Unit) {
+        hotwordModeCallback = callback
+    }
+    
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -132,7 +156,7 @@ class VoiceCommandService : Service() {
             ).apply {
                 description = "Narrator app voice command service"
                 setShowBadge(false)
-                setSound(null, null)  // Disable notification sound
+                setSound(null, null)
             }
             
             val notificationManager = getSystemService(NotificationManager::class.java)
@@ -150,7 +174,7 @@ class VoiceCommandService : Service() {
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
-            .setSilent(true)  // No sound/vibration
+            .setSilent(true)
             .build()
     }
     
@@ -162,6 +186,7 @@ class VoiceCommandService : Service() {
     
     override fun onDestroy() {
         super.onDestroy()
+        watchdogHandler.removeCallbacks(watchdogRunnable)
         if (::voiceCommandManager.isInitialized) {
             voiceCommandManager.cleanup()
         }

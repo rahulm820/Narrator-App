@@ -74,6 +74,19 @@ class MainActivity : ComponentActivity() {
                 handleVoiceCommand(command)
             }
             
+            // ===== NEW: Listen for hotword mode changes to coordinate with DecisionEngine =====
+            voiceCommandService?.setHotwordModeCallback { isHotwordMode ->
+                combinedAnalyzer?.getDecisionEngine()?.setVoiceListeningState(isHotwordMode)
+                
+                runOnUiThread {
+                    if (isHotwordMode) {
+                        voiceIndicator.setImageResource(android.R.drawable.ic_btn_speak_now)
+                    } else {
+                        voiceIndicator.setImageResource(android.R.drawable.ic_menu_edit)  // Different icon for command mode
+                    }
+                }
+            }
+            
             Log.d("MainActivity", "Voice command service connected")
         }
 
@@ -117,68 +130,65 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-private fun setupButtonListeners() {
-    findViewById<Button>(R.id.btnNormalMode)?.setOnClickListener {
-        combinedAnalyzer?.mode = CombinedAnalyzer.Mode.OBJECT_AND_TEXT
-        statusText.text = "Normal Mode"
-        ttsManager.speak("Normal mode activated")
-    }
+    private fun setupButtonListeners() {
+        findViewById<Button>(R.id.btnNormalMode)?.setOnClickListener {
+            combinedAnalyzer?.mode = CombinedAnalyzer.Mode.OBJECT_AND_TEXT
+            statusText.text = "Normal Mode"
+            ttsManager.speak("Normal mode activated")
+            Log.i("MainActivity", "Switched to NORMAL mode")
+        }
 
-    findViewById<Button>(R.id.btnReadingMode)?.setOnClickListener {
-        combinedAnalyzer?.mode = CombinedAnalyzer.Mode.READING_ONLY
-        statusText.text = "Reading Mode"
-        ttsManager.speak("Reading mode activated")
-    }
+        findViewById<Button>(R.id.btnReadingMode)?.setOnClickListener {
+            combinedAnalyzer?.mode = CombinedAnalyzer.Mode.READING_ONLY
+            statusText.text = "Reading Mode"
+            ttsManager.speak("Reading mode activated")
+            Log.i("MainActivity", "Switched to READING mode")
+        }
 
-    findViewById<Button>(R.id.btnRecognitionMode)?.setOnClickListener {
-        combinedAnalyzer?.mode = CombinedAnalyzer.Mode.RECOGNITION_MODE
-        statusText.text = "Recognition Mode"
-        ttsManager.speak("Recognition mode activated")
-    }
+        findViewById<Button>(R.id.btnRecognitionMode)?.setOnClickListener {
+            combinedAnalyzer?.mode = CombinedAnalyzer.Mode.RECOGNITION_MODE
+            statusText.text = "Recognition Mode"
+            ttsManager.speak("Recognition mode activated")
+            Log.i("MainActivity", "Switched to RECOGNITION mode")
+        }
 
-    findViewById<Button>(R.id.btnVoiceCommand)?.setOnClickListener {
-        if (serviceBound && voiceCommandService?.isListening() == true) {
-            voiceCommandService?.stopListening()
-            statusText.text = "Voice paused"
-        } else {
-            voiceCommandService?.startListening(startWithHotword = false)
-            statusText.text = "Listening...."
+        findViewById<Button>(R.id.btnVoiceCommand)?.setOnClickListener {
+            if (serviceBound && voiceCommandService?.isListening() == true) {
+                voiceCommandService?.stopListening()
+                statusText.text = "Voice paused"
+            } else {
+                voiceCommandService?.startListening(startWithHotword = false)
+                statusText.text = "Listening...."
+            }
+        }
+
+        findViewById<Button>(R.id.btnNavigation)?.setOnClickListener {
+            showNavigationDialog()
+        }
+
+        findViewById<Button>(R.id.btnMemory)?.setOnClickListener {
+            showMemoryDialog()
+        }
+
+        findViewById<Button>(R.id.btnTestTTS)?.setOnClickListener {
+            Log.i("MainActivity", "Test TTS button clicked")
+            statusText.text = "Testing TTS..."
+            ttsManager.speak("Test. This is a test announcement. If you hear this, TTS is working.")
+        }
+
+        findViewById<Button>(R.id.btnAnnounceDetections)?.setOnClickListener {
+            val currentObjects = overlayView.objects
+            Log.i("MainActivity", "Announce detections clicked. Found ${currentObjects.size} objects")
+            
+            if (currentObjects.isEmpty()) {
+                ttsManager.speak("No objects currently detected")
+                statusText.text = "No objects detected"
+            } else {
+                // ===== FIXED: Request scene description through DecisionEngine =====
+                combinedAnalyzer?.getDecisionEngine()?.requestSceneDescription()
+            }
         }
     }
-
-    findViewById<Button>(R.id.btnNavigation)?.setOnClickListener {
-        showNavigationDialog()
-    }
-
-    findViewById<Button>(R.id.btnMemory)?.setOnClickListener {
-        showMemoryDialog()
-    }
-
-    // Add this to MainActivity.kt in setupButtonListeners()
-
-findViewById<Button>(R.id.btnTestTTS)?.setOnClickListener {
-    Log.i("MainActivity", "Test TTS button clicked")
-    statusText.text = "Testing TTS..."
-    ttsManager.speak("Test. This is a test announcement. If you hear this, TTS is working.")
-}
-
-// Add this to test detection announcements
-findViewById<Button>(R.id.btnAnnounceDetections)?.setOnClickListener {
-    val currentObjects = overlayView.objects
-    Log.i("MainActivity", "Announce detections clicked. Found ${currentObjects.size} objects")
-    
-    if (currentObjects.isEmpty()) {
-        ttsManager.speak("No objects currently detected")
-        statusText.text = "No objects detected"
-    } else {
-        val objects = currentObjects.take(3).joinToString(", ") { it.label }
-        val announcement = "I see: $objects"
-        ttsManager.speak(announcement)
-        statusText.text = announcement
-        Log.i("MainActivity", "Announcing: $announcement")
-    }
-}
-}
 
     private fun requestPermissions() {
         val permissions = arrayOf(
@@ -372,172 +382,167 @@ findViewById<Button>(R.id.btnAnnounceDetections)?.setOnClickListener {
     }
 
     private fun showLearnFaceDialog() {
-    ttsManager.speak("Please say the person's name now", TTSManager.Priority.HIGH)
-    
-    // Wait for TTS to finish, then start listening
-    voiceInputHandler.postDelayed({
-        startVoiceCapture { spokenName ->
-            val cleanName = spokenName.trim()
-            
-            if (cleanName.isEmpty()) {
-                ttsManager.speak("No name detected. Cancelled.")
-                return@startVoiceCapture
-            }
-            
-            // Confirm with user
-            ttsManager.speak("I heard: $cleanName. Say confirm to save, retry to try again, or cancel")
-            
-            voiceInputHandler.postDelayed({
-                startVoiceCapture { response ->
-                    when (response.lowercase().replace(" ", "")) {
-                        "confirm" -> {
-                            captureFaceForLearning(cleanName)
-                        }
-                        "retry" -> {
-                            showLearnFaceDialog()  // Try again
-                        }
-                        "cancel" -> {
-                            ttsManager.speak("Cancelled")
-                        }
-                        else -> {
-                            ttsManager.speak("I didn't understand. Cancelled.")
+        ttsManager.speak("Please say the person's name now", TTSManager.Priority.HIGH)
+        
+        voiceInputHandler.postDelayed({
+            startVoiceCapture { spokenName ->
+                val cleanName = spokenName.trim()
+                
+                if (cleanName.isEmpty()) {
+                    ttsManager.speak("No name detected. Cancelled.")
+                    return@startVoiceCapture
+                }
+                
+                ttsManager.speak("I heard: $cleanName. Say confirm to save, retry to try again, or cancel")
+                
+                voiceInputHandler.postDelayed({
+                    startVoiceCapture { response ->
+                        when (response.lowercase().replace(" ", "")) {
+                            "confirm" -> {
+                                captureFaceForLearning(cleanName)
+                            }
+                            "retry" -> {
+                                showLearnFaceDialog()
+                            }
+                            "cancel" -> {
+                                ttsManager.speak("Cancelled")
+                            }
+                            else -> {
+                                ttsManager.speak("I didn't understand. Cancelled.")
+                            }
                         }
                     }
-                }
-            }, 2500)  // Wait for TTS to finish
-        }
-    }, 2000)  // Wait for TTS to finish
-}
+                }, 2500)
+            }
+        }, 2000)
+    }
 
     private fun showLearnPlaceDialog() {
-    ttsManager.speak("Please say the place name now", TTSManager.Priority.HIGH)
-    
-    voiceInputHandler.postDelayed({
-        startVoiceCapture { spokenName ->
-            val cleanName = spokenName.trim()
-            
-            if (cleanName.isEmpty()) {
-                ttsManager.speak("No name detected. Cancelled.")
-                return@startVoiceCapture
-            }
-            
-            ttsManager.speak("I heard: $cleanName. Say confirm to save, retry to try again, or cancel")
-            
-            voiceInputHandler.postDelayed({
-                startVoiceCapture { response ->
-                    when (response.lowercase().replace(" ", "")) {
-                        "confirm" -> {
-                            capturePlaceForLearning(cleanName)
-                        }
-                        "retry" -> {
-                            showLearnPlaceDialog()
-                        }
-                        "cancel" -> {
-                            ttsManager.speak("Cancelled")
-                        }
-                        else -> {
-                            ttsManager.speak("I didn't understand. Cancelled.")
+        ttsManager.speak("Please say the place name now", TTSManager.Priority.HIGH)
+        
+        voiceInputHandler.postDelayed({
+            startVoiceCapture { spokenName ->
+                val cleanName = spokenName.trim()
+                
+                if (cleanName.isEmpty()) {
+                    ttsManager.speak("No name detected. Cancelled.")
+                    return@startVoiceCapture
+                }
+                
+                ttsManager.speak("I heard: $cleanName. Say confirm to save, retry to try again, or cancel")
+                
+                voiceInputHandler.postDelayed({
+                    startVoiceCapture { response ->
+                        when (response.lowercase().replace(" ", "")) {
+                            "confirm" -> {
+                                capturePlaceForLearning(cleanName)
+                            }
+                            "retry" -> {
+                                showLearnPlaceDialog()
+                            }
+                            "cancel" -> {
+                                ttsManager.speak("Cancelled")
+                            }
+                            else -> {
+                                ttsManager.speak("I didn't understand. Cancelled.")
+                            }
                         }
                     }
-                }
-            }, 2500)
-        }
-    }, 2000)
-}
-
-private fun startVoiceCapture(onResult: (String) -> Unit) {
-    // Pause main voice service temporarily
-    voiceCommandService?.stopListening()
-    
-    voiceInputCallback = onResult
-    
-    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
-        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+                }, 2500)
+            }
+        }, 2000)
     }
-    
-    voiceInputRecognizer?.destroy()
-    voiceInputRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-    voiceInputRecognizer?.setRecognitionListener(object : RecognitionListener {
-        override fun onResults(results: Bundle?) {
-            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val spokenText = matches?.firstOrNull() ?: ""
-            
-            Log.i("VoiceInput", "Captured: '$spokenText'")
-            
-            voiceInputRecognizer?.destroy()
-            voiceInputRecognizer = null
-            
-            // Resume main voice service
-            voiceInputHandler.postDelayed({
-                voiceCommandService?.startListening(startWithHotword = true)
-            }, 1000)
-            
-            voiceInputCallback?.invoke(spokenText)
-            voiceInputCallback = null
+
+    private fun startVoiceCapture(onResult: (String) -> Unit) {
+        voiceCommandService?.stopListening()
+        
+        voiceInputCallback = onResult
+        
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
         }
         
-        override fun onError(error: Int) {
-            val errorMsg = when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected"
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Timeout"
-                SpeechRecognizer.ERROR_AUDIO -> "Audio error"
-                else -> "Recognition error $error"
+        voiceInputRecognizer?.destroy()
+        voiceInputRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        voiceInputRecognizer?.setRecognitionListener(object : RecognitionListener {
+            override fun onResults(results: Bundle?) {
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val spokenText = matches?.firstOrNull() ?: ""
+                
+                Log.i("VoiceInput", "Captured: '$spokenText'")
+                
+                voiceInputRecognizer?.destroy()
+                voiceInputRecognizer = null
+                
+                voiceInputHandler.postDelayed({
+                    voiceCommandService?.startListening(startWithHotword = true)
+                }, 1000)
+                
+                voiceInputCallback?.invoke(spokenText)
+                voiceInputCallback = null
             }
             
-            Log.e("VoiceInput", "Error: $errorMsg")
+            override fun onError(error: Int) {
+                val errorMsg = when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected"
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Timeout"
+                    SpeechRecognizer.ERROR_AUDIO -> "Audio error"
+                    else -> "Recognition error $error"
+                }
+                
+                Log.e("VoiceInput", "Error: $errorMsg")
+                
+                voiceInputRecognizer?.destroy()
+                voiceInputRecognizer = null
+                
+                voiceInputHandler.postDelayed({
+                    voiceCommandService?.startListening(startWithHotword = true)
+                }, 1000)
+                
+                voiceInputCallback?.invoke("")
+                voiceInputCallback = null
+            }
             
-            voiceInputRecognizer?.destroy()
-            voiceInputRecognizer = null
+            override fun onReadyForSpeech(params: Bundle?) {
+                Log.d("VoiceInput", "Ready for speech")
+                runOnUiThread {
+                    statusText.text = "Listening..."
+                }
+            }
             
-            // Resume main voice service
-            voiceInputHandler.postDelayed({
-                voiceCommandService?.startListening(startWithHotword = true)
-            }, 1000)
+            override fun onBeginningOfSpeech() {
+                Log.d("VoiceInput", "Speech detected")
+            }
             
+            override fun onEndOfSpeech() {
+                Log.d("VoiceInput", "Speech ended")
+                runOnUiThread {
+                    statusText.text = "Processing..."
+                }
+            }
+            
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+        
+        try {
+            voiceInputRecognizer?.startListening(intent)
+            runOnUiThread {
+                statusText.text = "Say the name..."
+                voiceIndicator.visibility = ImageView.VISIBLE
+            }
+        } catch (e: Exception) {
+            Log.e("VoiceInput", "Failed to start recognition", e)
             voiceInputCallback?.invoke("")
             voiceInputCallback = null
         }
-        
-        override fun onReadyForSpeech(params: Bundle?) {
-            Log.d("VoiceInput", "Ready for speech")
-            runOnUiThread {
-                statusText.text = "Listening..."
-            }
-        }
-        
-        override fun onBeginningOfSpeech() {
-            Log.d("VoiceInput", "Speech detected")
-        }
-        
-        override fun onEndOfSpeech() {
-            Log.d("VoiceInput", "Speech ended")
-            runOnUiThread {
-                statusText.text = "Processing..."
-            }
-        }
-        
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onPartialResults(partialResults: Bundle?) {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-    })
-    
-    try {
-        voiceInputRecognizer?.startListening(intent)
-        runOnUiThread {
-            statusText.text = "Say the name..."
-            voiceIndicator.visibility = ImageView.VISIBLE
-        }
-    } catch (e: Exception) {
-        Log.e("VoiceInput", "Failed to start recognition", e)
-        voiceInputCallback?.invoke("")
-        voiceInputCallback = null
     }
-}
 
     private fun showMemoriesDialog() {
         lifecycleScope.launch {
@@ -603,23 +608,8 @@ private fun startVoiceCapture(onResult: (String) -> Unit) {
     }
 
     private fun describeCurrentScene() {
-        val objects = getCurrentDetections()
-        if (objects.isEmpty()) {
-            ttsManager.speak("I don't see any objects in view")
-        } else {
-            val description = buildString {
-                append("I see ")
-                objects.take(5).forEachIndexed { index, obj ->
-                    if (index > 0 && index == objects.size - 1) {
-                        append(" and ")
-                    } else if (index > 0) {
-                        append(", ")
-                    }
-                    append("a ${obj.label}")
-                }
-            }
-            ttsManager.speak(description)
-        }
+        // ===== FIXED: Use DecisionEngine's requestSceneDescription =====
+        combinedAnalyzer?.getDecisionEngine()?.requestSceneDescription()
     }
 
     private fun adjustVolume(increase: Boolean) {
@@ -633,15 +623,15 @@ private fun startVoiceCapture(onResult: (String) -> Unit) {
     }
 
     private fun announceAvailableCommands() {
-        val commands = """
-            Available commands:
-            Navigation: start navigation, stop navigation, record waypoint, where am I.
-            Reading: read text, stop reading.
-            Memory: learn face, learn place, who is this, where is this.
-            Scene: what do you see, find object.
-            Control: increase volume, decrease volume, pause, resume.
-        """.trimIndent()
-        ttsManager.speak(commands)
+    val commands = """
+        Here are the commands you can use:
+        To navigate, say 'Start Navigation' or 'Where am I'.
+        To read, say 'Read Text'.
+        To recognize people, say 'Who is this'.
+        To describe the room, say 'What do you see'.
+        You can also say 'Stop' or 'Pause' at any time.
+    """.trimIndent()
+    ttsManager.speak(commands, TTSManager.Priority.HIGH)
     }
 
     private suspend fun captureCurrentFrame(): Bitmap? {
@@ -660,11 +650,9 @@ private fun startVoiceCapture(onResult: (String) -> Unit) {
     }
 
     override fun onDestroy() {
-
         voiceInputRecognizer?.destroy()
         voiceInputRecognizer = null
         voiceInputHandler.removeCallbacksAndMessages(null)
-        
         
         if (serviceBound) {
             unbindService(serviceConnection)
@@ -673,7 +661,6 @@ private fun startVoiceCapture(onResult: (String) -> Unit) {
         
         VoiceCommandService.stop(this)
         
-        // Shutdown camera first (releases resources)
         if (::cameraXManager.isInitialized) {
             cameraXManager.shutdown()
         }

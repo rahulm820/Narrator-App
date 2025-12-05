@@ -12,9 +12,10 @@ import android.speech.SpeechRecognizer
 import android.util.Log
 import com.example.narratorapp.narration.TTSManager
 import java.util.*
+import kotlin.math.min
 
 /**
- * FIXED VERSION - Preserves spaces, handles multi-word names, checks all hypotheses
+ * UPDATED VERSION - Includes Fuzzy Matching for robust command detection
  */
 class VoiceCommandManager(
     private val context: Context,
@@ -28,6 +29,7 @@ class VoiceCommandManager(
     
     private var onCommandRecognized: ((VoiceCommand) -> Unit)? = null
     private var onListeningStateChanged: ((Boolean) -> Unit)? = null
+    private var onHotwordModeChanged: ((Boolean) -> Unit)? = null
     
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     
@@ -37,6 +39,11 @@ class VoiceCommandManager(
     )
     
     private var isTTSSpeaking = false
+    
+    // Track consecutive failures to prevent infinite restart loops
+    private var consecutiveErrors = 0
+    private val maxConsecutiveErrors = 5
+    private var lastSuccessTime = System.currentTimeMillis()
 
     init {
         initializeSpeechRecognizer()
@@ -48,20 +55,18 @@ class VoiceCommandManager(
                 pauseRecognition()
             } else if (!speaking && !isListening) {
                 Log.i("VoiceCommandManager", "✓ TTS finished - resuming recognition")
-                handler.postDelayed({ resumeRecognition() }, 500)
+                handler.postDelayed({ resumeRecognition() }, 200)
             }
         }
     }
     
-    // ===== NEW: Proper text normalization that preserves spaces =====
     private fun normalizeSpokenText(raw: String?): String {
         if (raw.isNullOrBlank()) return ""
         
-        // Lowercase, trim, collapse multiple spaces to one
+        // Lowercase, trim, collapse multiple spaces
         val lower = raw.lowercase(Locale.getDefault()).trim()
         val collapsed = lower.replace(Regex("\\s+"), " ")
-        
-        // Remove punctuation except apostrophes and dashes (for names like "O'Brien" or "Mary-Jane")
+        // Keep alphanumeric, spaces, apostrophes and dashes
         val cleaned = collapsed.replace(Regex("[^a-z0-9\\s''-]"), "")
         
         return cleaned
@@ -115,6 +120,7 @@ class VoiceCommandManager(
         
         isHotwordMode = startWithHotword
         Log.i("VoiceCommandManager", "Starting: ${if (startWithHotword) "HOTWORD" else "COMMAND"}")
+        onHotwordModeChanged?.invoke(isHotwordMode)
         startRecognition()
     }
     
@@ -127,6 +133,7 @@ class VoiceCommandManager(
             Log.e("VoiceCommandManager", "Error canceling recognizer", e)
         }
         onListeningStateChanged?.invoke(false)
+        onHotwordModeChanged?.invoke(false)
         Log.i("VoiceCommandManager", "Stopped listening")
     }
     
@@ -137,13 +144,14 @@ class VoiceCommandManager(
             } catch (e: Exception) {
                 Log.e("VoiceCommandManager", "Error pausing", e)
             }
+            isListening = false
             Log.d("VoiceCommandManager", "Recognition paused")
         }
     }
     
     private fun resumeRecognition() {
         if (isListening && !isTTSSpeaking) {
-            startRecognition()
+            startListening(isHotwordMode)
             Log.d("VoiceCommandManager", "Recognition resumed")
         }
     }
@@ -154,11 +162,26 @@ class VoiceCommandManager(
             return
         }
         
+        // Safety check for loops
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+            val timeSinceLastSuccess = System.currentTimeMillis() - lastSuccessTime
+            if (timeSinceLastSuccess < 30000) { // 10 seconds
+                Log.e("VoiceCommandManager", "Too many errors, waiting before retry...")
+                handler.postDelayed({
+                    consecutiveErrors = 0
+                    if (isListening) startRecognition()
+                }, 5000)
+                return
+            } else {
+                consecutiveErrors = 0 // Reset after timeout
+            }
+        }
+        
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)  // Get multiple hypotheses
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
         }
@@ -168,12 +191,15 @@ class VoiceCommandManager(
         try {
             speechRecognizer?.startListening(intent)
             onListeningStateChanged?.invoke(true)
+            onHotwordModeChanged?.invoke(isHotwordMode)
             
             val mode = if (isHotwordMode) "HOTWORD" else "COMMAND"
             Log.i("VoiceCommandManager", "🎤 Started ($mode)")
         } catch (e: Exception) {
             Log.e("VoiceCommandManager", "Failed to start recognition", e)
             isListening = false
+            consecutiveErrors++
+            handler.postDelayed({ startRecognition() }, 1000)
         }
     }
     
@@ -182,10 +208,12 @@ class VoiceCommandManager(
         override fun onReadyForSpeech(params: Bundle?) {
             val mode = if (isHotwordMode) "hotword" else "command"
             Log.d("VoiceCommandManager", "✓ Ready ($mode)")
+            consecutiveErrors = 0 
         }
         
         override fun onBeginningOfSpeech() {
             Log.d("VoiceCommandManager", "🗣️ Speech detected")
+            lastSuccessTime = System.currentTimeMillis()
         }
         
         override fun onRmsChanged(rmsdB: Float) {}
@@ -195,12 +223,11 @@ class VoiceCommandManager(
             Log.d("VoiceCommandManager", "Speech ended")
         }
         
-        // ===== FIXED: Safer error handling with cancel() =====
         override fun onError(error: Int) {
             val errorMessage = when (error) {
                 SpeechRecognizer.ERROR_NO_MATCH -> "NO_MATCH"
                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "TIMEOUT"
-                SpeechRecognizer.ERROR_AUDIO -> "AUDIO_ERROR (mic busy?)"
+                SpeechRecognizer.ERROR_AUDIO -> "AUDIO_ERROR"
                 SpeechRecognizer.ERROR_CLIENT -> "CLIENT_ERROR"
                 SpeechRecognizer.ERROR_NETWORK -> "NETWORK_ERROR"
                 SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "NETWORK_TIMEOUT"
@@ -210,202 +237,173 @@ class VoiceCommandManager(
             }
             
             Log.w("VoiceDebug", "❌ $errorMessage")
-            
-            // Handle audio errors specially
-            if (error == SpeechRecognizer.ERROR_AUDIO) {
-                Log.e("VoiceCommandManager", "⚠️ Microphone conflict detected!")
-                try { 
-                    speechRecognizer?.cancel() 
-                } catch (e: Exception) {}
-                
-                handler.postDelayed({
-                    if (isListening && isMicrophoneAvailable()) {
-                        startRecognition()
-                    }
-                }, 2000)
-                return
+            val isIgnorable = error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+
+            if (!isIgnorable) {
+                consecutiveErrors++
+                Log.w("VoiceDebug", "Error: $error")
             }
             
-            // Normal restart: cancel then restart after a short delay
-            try { 
-                speechRecognizer?.cancel() 
-            } catch (e: Exception) {}
+            isListening = false // Ensure state is reset
             
-            if (isListening && !isTTSSpeaking) {
-                handler.postDelayed({
-                    if (isListening) startRecognition()
-                }, 1000)
+            // FIX: Fast restart (100ms) for timeout/no match to keep listening
+            // val delay = if (isIgnorable) 100L else 1000L
+            
+            if (!isTTSSpeaking) {
+                handler.postDelayed({ startRecognition() }, 100L)
             }
         }
         
-        // ===== FIXED: Check all hypotheses, preserve spaces =====
         override fun onResults(results: Bundle?) {
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            
-            if (matches.isNullOrEmpty()) {
-                Log.w("VoiceDebug", "No results")
-                if (isListening && !isTTSSpeaking) {
-                    handler.postDelayed({ 
-                        if (isListening) startRecognition() 
-                    }, 500)
-                }
-                return
-            }
-            
-            val firstNonEmpty = matches.firstOrNull { !it.isNullOrBlank() } ?: matches[0]
-            val rawSpokenText = firstNonEmpty
-            val normalized = normalizeSpokenText(rawSpokenText)
-            
-            Log.i("VoiceDebug", "📣 Raw: '$rawSpokenText' → Normalized: '$normalized'")
-            
-            // HOTWORD MODE: Check all hypotheses for hotword
-            if (isHotwordMode) {
-                val foundHotword = matches
-                    .map { normalizeSpokenText(it) }
-                    .firstOrNull { hyp ->
-                        hotwords.any { hw ->
-                            // Allow optional spaces in hotword
-                            hyp.contains(hw) || hyp.contains(hw.replace(" ", ""))
-                        }
-                    }
-                
-                if (foundHotword != null) {
-                    Log.i("VoiceCommandManager", "✓ HOTWORD detected")
-                    
-                    // Pause recognition cleanly
-                    try { 
-                        speechRecognizer?.cancel() 
-                    } catch (e: Exception) {}
-                    
-                    ttsManager.speak("Yes?", TTSManager.Priority.HIGH)
-                    isHotwordMode = false
-                    
-                    handler.postDelayed({
-                        if (isListening && !isTTSSpeaking) {
-                            Log.i("VoiceCommandManager", "→ COMMAND mode")
-                            startRecognition()
-                        }
-                    }, 600)
-                } else {
-                    // No hotword - continue listening
-                    handler.postDelayed({ 
-                        if (isListening && !isTTSSpeaking) startRecognition() 
-                    }, 500)
-                }
-                return
-            }
-            
-            // COMMAND MODE: Check all hypotheses for valid command
-            var commandFound: VoiceCommand? = null
-            for (hyp in matches) {
-                val norm = normalizeSpokenText(hyp)
-                val parsed = parseCommand(norm)
-                if (parsed != null) {
-                    commandFound = parsed
-                    Log.i("VoiceCommandManager", "Found command in hypothesis: '$hyp'")
-                    break
-                }
-            }
-            
-            if (commandFound != null) {
-                Log.i("VoiceCommandManager", "✓ COMMAND: ${commandFound.getDescription()}")
-                onCommandRecognized?.invoke(commandFound)
-                isHotwordMode = true
-                
-                handler.postDelayed({ 
-                    if (isListening && !isTTSSpeaking) {
-                        Log.i("VoiceCommandManager", "→ HOTWORD mode")
-                        startRecognition()
-                    }
-                }, 600)
-            } else {
-                Log.w("VoiceCommandManager", "❌ Unknown: '$normalized'")
-                ttsManager.speak("I didn't understand")
-                isHotwordMode = true
-                
-                handler.postDelayed({ 
-                    if (isListening && !isTTSSpeaking) startRecognition() 
-                }, 1000)
-            }
+            processResults(matches)
+        }
+        private fun processResults(matches: ArrayList<String>?) {
+        if (matches.isNullOrEmpty()) {
+            if (!isTTSSpeaking) handler.postDelayed({ startRecognition() }, 100L)
+            return
         }
         
+        isListening = false // Will restart if needed
+        lastSuccessTime = System.currentTimeMillis()
+        consecutiveErrors = 0
+        
+        val normalized = normalizeSpokenText(matches.firstOrNull())
+        Log.i("VoiceDebug", "Heard: '$normalized'")
+        
+        if (isHotwordMode) {
+            val foundHotword = matches.any { hyp ->
+            val h = normalizeSpokenText(hyp)
+            // Check strict contains OR similarity score > 0.6
+            hotwords.any { hw -> 
+                h.contains(hw) || 
+                h.contains(hw.replace(" ", "")) ||
+                calculateSimilarity(h, hw) > 0.6 // <--- ALLOWS "Narratoe" / "Hay Narrator"
+            }
+            }
+            
+            if (foundHotword) {
+                Log.i("VoiceCommandManager", "✓ HOTWORD")
+                ttsManager.speak("Listening. Say 'Help' for commands.", TTSManager.Priority.HIGH)
+                isHotwordMode = false
+                onHotwordModeChanged?.invoke(false)
+                
+                // Wait for "Yes?" to finish before listening for command
+                handler.postDelayed({ startRecognition() }, 2500 ) 
+            } else {
+                handler.postDelayed({ startRecognition() }, 100L)
+            }
+        } else {
+            // Command Mode
+            val command = parseCommand(normalized)
+            if (command != null) {
+                onCommandRecognized?.invoke(command)
+                isHotwordMode = true
+                onHotwordModeChanged?.invoke(true)
+                handler.postDelayed({ startRecognition() }, 1000)
+            } else {
+                Log.w("VoiceCommandManager", "❌ Unknown command: '$normalized'")
+                ttsManager.speak("I didn't understand. Say 'Help' to hear the options.", TTSManager.Priority.HIGH)
+                isHotwordMode = true // Go back to hotword mode on failure? Or stay?
+                // Let's go back to hotword to avoid frustration loop
+                onHotwordModeChanged?.invoke(true)
+                handler.postDelayed({ startRecognition() }, 3000)
+            }
+        }
+    }
         override fun onPartialResults(partialResults: Bundle?) {}
         override fun onEvent(eventType: Int, params: Bundle?) {}
     }
     
-    // ===== FIXED: Preserve spaces, extract multi-word names =====
-    private fun parseCommand(normalizedText: String): VoiceCommand? {
-        val t = normalizedText
-        
-        return when {
-            t.contains("start navigation") || t.contains("start nav") -> 
-                VoiceCommand.StartNavigation
-                
-            t.contains("stop navigation") || t.contains("stop nav") -> 
-                VoiceCommand.StopNavigation
-                
-            t.contains("record waypoint") -> 
-                VoiceCommand.RecordWaypoint
-                
-            t.contains("where am i") || t.contains("what is my location") || t.contains("my location") -> 
-                VoiceCommand.GetLocation
-                
-            t.contains("read text") || t.contains("reading mode") || t.contains("read mode") -> 
-                VoiceCommand.EnableReadingMode
-                
-            t.contains("stop reading") || t.contains("normal mode") -> 
-                VoiceCommand.DisableReadingMode
-            
-            // ===== CRITICAL: Extract multi-word names =====
-            t.startsWith("learn face") -> {
-                val name = t.removePrefix("learn face").trim()
-                if (name.isNotEmpty()) {
-                    Log.i("VoiceCommandManager", "Extracted face name: '$name'")
-                    VoiceCommand.LearnFace(name)
-                } else {
-                    VoiceCommand.LearnFacePrompt
+    /**
+     * Uses Fuzzy Matching to find the best command
+     */
+    private fun parseCommand(spokenText: String): VoiceCommand? {
+        // 1. Define all possible targets
+        val targets = mapOf(
+            VoiceCommand.StartNavigation to listOf("start navigation", "start nav", "begin navigation"),
+            VoiceCommand.StopNavigation to listOf("stop navigation", "stop nav", "cancel navigation", "end navigation"),
+            VoiceCommand.RecordWaypoint to listOf("record waypoint", "save waypoint", "mark location"),
+            VoiceCommand.GetLocation to listOf("where am i", "my location", "current location", "what is my location"),
+            VoiceCommand.EnableReadingMode to listOf("read text", "reading mode", "start reading", "enable reading mode"),
+            VoiceCommand.DisableReadingMode to listOf("stop reading", "normal mode", "exit reading", "disable reading mode"),
+            VoiceCommand.RecognizeFace to listOf("who is this", "identify face", "recognize face"),
+            VoiceCommand.RecognizePlace to listOf("where is this", "identify place", "recognize place"),
+            VoiceCommand.DescribeScene to listOf("what do you see", "describe scene", "what is in front", "whats in front"),
+            VoiceCommand.FindObject to listOf("find object", "search for object"),
+            VoiceCommand.IncreaseVolume to listOf("increase volume", "volume up", "louder"),
+            VoiceCommand.DecreaseVolume to listOf("decrease volume", "volume down", "quieter"),
+            VoiceCommand.Pause to listOf("pause", "pause listening"),
+            VoiceCommand.Resume to listOf("resume", "resume listening"),
+            VoiceCommand.Help to listOf("help", "help me", "commands", "what can you do")
+        )
+
+        var bestCommand: VoiceCommand? = null
+        var bestScore = 0.0
+
+        // 2. Iterate and score
+        for ((command, phrases) in targets) {
+            for (phrase in phrases) {
+                val score = calculateSimilarity(spokenText, phrase)
+                if (score > bestScore) {
+                    bestScore = score
+                    bestCommand = command
                 }
             }
-            
-            t.startsWith("learn place") -> {
-                val name = t.removePrefix("learn place").trim()
-                if (name.isNotEmpty()) {
-                    Log.i("VoiceCommandManager", "Extracted place name: '$name'")
-                    VoiceCommand.LearnPlace(name)
-                } else {
-                    VoiceCommand.LearnPlacePrompt
-                }
-            }
-            
-            t.contains("who is this") || t.contains("identify face") || t.contains("recognize face") -> 
-                VoiceCommand.RecognizeFace
-                
-            t.contains("where is this") || t.contains("identify place") || t.contains("recognize place") -> 
-                VoiceCommand.RecognizePlace
-                
-            t.contains("what do you see") || t.contains("describe scene") -> 
-                VoiceCommand.DescribeScene
-                
-            t.contains("find object") -> 
-                VoiceCommand.FindObject
-                
-            t.contains("increase volume") || t.contains("volume up") -> 
-                VoiceCommand.IncreaseVolume
-                
-            t.contains("decrease volume") || t.contains("volume down") -> 
-                VoiceCommand.DecreaseVolume
-                
-            t.contains("pause") -> 
-                VoiceCommand.Pause
-                
-            t.contains("resume") -> 
-                VoiceCommand.Resume
-                
-            t.contains("help") -> 
-                VoiceCommand.Help
-                
-            else -> null
         }
+
+        // 3. Special handling for dynamic commands (Learn Face/Place)
+        if (spokenText.startsWith("learn face") || spokenText.startsWith("remember face")) {
+            val name = spokenText.removePrefix("learn face").removePrefix("remember face").trim()
+            return if (name.isNotEmpty()) VoiceCommand.LearnFace(name) else VoiceCommand.LearnFacePrompt
+        }
+        
+        if (spokenText.startsWith("learn place") || spokenText.startsWith("remember place")) {
+            val name = spokenText.removePrefix("learn place").removePrefix("remember place").trim()
+            return if (name.isNotEmpty()) VoiceCommand.LearnPlace(name) else VoiceCommand.LearnPlacePrompt
+        }
+
+        Log.d("VoiceDebug", "Best match: ${bestCommand?.getDescription()} with score $bestScore")
+        
+        // 4. Threshold check (0.65 allows for "art nation" -> "start navigation")
+        return if (bestScore > 0.65) bestCommand else null
+    }
+
+    /**
+     * Calculates similarity between two strings (0.0 to 1.0)
+     */
+    private fun calculateSimilarity(s1: String, s2: String): Double {
+        val longer = if (s1.length > s2.length) s1 else s2
+        val shorter = if (s1.length > s2.length) s2 else s1
+        
+        val longerLength = longer.length
+        if (longerLength == 0) return 1.0
+        
+        val editDistance = levenshteinDistance(longer, shorter)
+        return (longerLength - editDistance) / longerLength.toDouble()
+    }
+
+    private fun levenshteinDistance(s1: String, s2: String): Int {
+        val costs = IntArray(s2.length + 1)
+        for (i in 0..s1.length) {
+            var lastValue = i
+            for (j in 0..s2.length) {
+                if (i == 0) {
+                    costs[j] = j
+                } else {
+                    if (j > 0) {
+                        var newValue = costs[j - 1]
+                        if (s1[i - 1] != s2[j - 1]) {
+                            newValue = min(min(newValue, lastValue), costs[j]) + 1
+                        }
+                        costs[j - 1] = lastValue
+                        lastValue = newValue
+                    }
+                }
+            }
+            if (i > 0) costs[s2.length] = lastValue
+        }
+        return costs[s2.length]
     }
     
     fun setOnCommandRecognizedListener(listener: (VoiceCommand) -> Unit) {
@@ -416,7 +414,12 @@ class VoiceCommandManager(
         onListeningStateChanged = listener
     }
     
+    fun setOnHotwordModeChangedListener(listener: (Boolean) -> Unit) {
+        onHotwordModeChanged = listener
+    }
+    
     fun isCurrentlyListening() = isListening
+    fun isInHotwordMode() = isHotwordMode
     
     fun cleanup() {
         stopListening()

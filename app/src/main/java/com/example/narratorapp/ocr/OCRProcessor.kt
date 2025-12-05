@@ -53,6 +53,7 @@ class OCRProcessor {
             // Process ALL text blocks, not just lines
             visionText.textBlocks.forEach { block ->
                 // Add the entire block as one result (better for paragraphs)
+                Log.i("OCRProcessor", "Detected block: ${block.text}")
                 if (block.text.length > 1) {  // Skip single characters
                     results.add(
                         OCRLine(

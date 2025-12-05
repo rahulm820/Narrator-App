@@ -4,42 +4,54 @@ import android.util.Log
 import com.example.narratorapp.camera.CombinedAnalyzer
 import com.example.narratorapp.detection.DetectedObject
 import com.example.narratorapp.ocr.OCRLine
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * SMART VERSION - Only announces:
- * 1. Dangerous/safety-critical objects automatically
- * 2. Everything else ONLY when user asks via voice command
+ * FIXED VERSION - Proper coordination with voice service
+ * - Only speaks when voice is not listening for hotword
+ * - Batches announcements to reduce interruptions
+ * - Respects reading mode completely
  */
 class DecisionEngine(private val ttsManager: TTSManager) {
 
+    // ===== NEW: Voice coordination =====
+    private val voiceIsListeningForHotword = AtomicBoolean(false)
+    private var lastVoiceStateChange = 0L
+    private val voiceStateDebounce = 1000L  // 1s grace period after voice state change
+    
     // Throttling for announcements
     private var lastNarrationTime = 0L
-    private val narrationCooldown = 2000L
+    private val narrationCooldown = 3000L  // Increased from 2s to 3s
     
     private var lastObjectNarrationTime = 0L
-    private val objectNarrationCooldown = 500L
+    private val objectNarrationCooldown = 1000L  // Increased from 500ms
     
     private val seenObjects = mutableMapOf<String, Long>()
-    private val objectMemoryDuration = 5000L  // Remember for 5 seconds
+    private val objectMemoryDuration = 10000L  // Increased from 5s to 10s
     
     private val objectDetectionCount = mutableMapOf<String, Int>()
-    private val requiredConsecutiveDetections = 2  // Need 2 frames for safety
+    private val requiredConsecutiveDetections = 3  // Increased from 2 to 3
     
     private var processCallCount = 0
     
-    // ===== NEW: Manual announcement mode =====
+    // Manual announcement mode
     private var manualAnnounceRequested = false
     
-    // ===== SAFETY-CRITICAL OBJECTS (announce automatically) =====
+    // ===== CRITICAL DANGER OBJECTS (announce even during hotword listening) =====
+    private val criticalDangerObjects = setOf(
+        "car", "truck", "bus", "motorcycle", "bicycle"  // Only vehicles
+    )
+    
+    // ===== SAFETY-CRITICAL OBJECTS (announce when voice not listening) =====
     private val dangerousObjects = setOf(
-        // Vehicles
+        // Vehicles (already in critical)
         "car", "truck", "bus", "motorcycle", "bicycle", "train",
         
         // Traffic infrastructure
         "traffic light", "stop sign",
         
         // Moving hazards
-        "dog","cat" , // People walking in path
+        "dog", "cat",
         
         // Obstacles
         "fire hydrant", "parking meter"
@@ -55,6 +67,25 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         "potted plant", "person", "bird"
     )
 
+    // ===== NEW: Voice coordination API =====
+    fun setVoiceListeningState(isListeningForHotword: Boolean) {
+        val changed = voiceIsListeningForHotword.getAndSet(isListeningForHotword) != isListeningForHotword
+        if (changed) {
+            lastVoiceStateChange = System.currentTimeMillis()
+            Log.i("DecisionEngine", "Voice state changed: hotword=$isListeningForHotword")
+        }
+    }
+    
+    private fun canAnnounce(): Boolean {
+        val now = System.currentTimeMillis()
+        
+        // Always allow critical dangers
+        // For everything else, check voice state with debounce
+        val gracePeriodActive = (now - lastVoiceStateChange) < voiceStateDebounce
+        
+        return !voiceIsListeningForHotword.get() || gracePeriodActive
+    }
+
     // ===== NEW: Request manual announcement (called by voice command) =====
     fun requestSceneDescription() {
         manualAnnounceRequested = true
@@ -65,9 +96,9 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         processCallCount++
         val now = System.currentTimeMillis()
         
-        if (processCallCount % 10 == 0) {
-            Log.i("DecisionEngine", "=== PROCESS CALL #$processCallCount ===")
-            Log.i("DecisionEngine", "Objects with depth: ${objectsWithDepth.size}")
+        if (processCallCount % 30 == 0) {  // Reduced logging frequency
+            Log.i("DecisionEngine", "=== FRAME #$processCallCount ===")
+            Log.i("DecisionEngine", "Objects: ${objectsWithDepth.size}, Voice listening: ${voiceIsListeningForHotword.get()}")
         }
         
         if (objectsWithDepth.isEmpty()) {
@@ -75,22 +106,39 @@ class DecisionEngine(private val ttsManager: TTSManager) {
             return
         }
         
-        // ===== SPLIT: Dangerous vs Informational =====
-        val dangerous = objectsWithDepth.filter { isDangerous(it.obj.label) }
+        // ===== SPLIT: Critical vs Dangerous vs Informational =====
+        val critical = objectsWithDepth.filter { isCriticalDanger(it.obj.label) && it.depth != null && it.depth < 1.5f }
+        val dangerous = objectsWithDepth.filter { isDangerous(it.obj.label) && !isCriticalDanger(it.obj.label) }
         val informational = objectsWithDepth.filter { !isDangerous(it.obj.label) }
         
-        Log.i("DecisionEngine", "Dangerous: ${dangerous.size}, Info: ${informational.size}")
+        // ===== ALWAYS announce critical dangers (even during hotword listening) =====
+        if (critical.isNotEmpty()) {
+            announceObjectsWithDepth(critical, now, forceAnnounce = true, priority = TTSManager.Priority.CRITICAL)
+            return  // Don't process anything else
+        }
         
-        // ===== ALWAYS announce dangerous objects =====
+        // ===== Check if we can announce (voice not listening for hotword) =====
+        if (!canAnnounce()) {
+            if (processCallCount % 30 == 0) {
+                Log.d("DecisionEngine", "⏸️ Skipping announcements - voice is listening for hotword")
+            }
+            return
+        }
+        
+        // ===== Announce dangerous objects =====
         if (dangerous.isNotEmpty()) {
-            announceObjectsWithDepth(dangerous, now, forceAnnounce = true)
+            announceObjectsWithDepth(dangerous, now, forceAnnounce = false, priority = TTSManager.Priority.HIGH)
         }
         
         // ===== ONLY announce informational if user requested =====
         if (manualAnnounceRequested && informational.isNotEmpty()) {
-            announceObjectsWithDepth(informational, now, forceAnnounce = true)
+            announceObjectsWithDepth(informational, now, forceAnnounce = true, priority = TTSManager.Priority.HIGH)
             manualAnnounceRequested = false  // Reset flag
         }
+    }
+    
+    private fun isCriticalDanger(label: String): Boolean {
+        return criticalDangerObjects.contains(label.lowercase())
     }
     
     private fun isDangerous(label: String): Boolean {
@@ -101,29 +149,35 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         processCallCount++
         val now = System.currentTimeMillis()
         
-        if (processCallCount % 10 == 0) {
-            Log.i("DecisionEngine", "=== PROCESS CALL #$processCallCount ===")
-            Log.i("DecisionEngine", "Objects: ${objects.size}, Texts: ${texts.size}")
-        }
-        
         // Priority 1: Announce text if present (reading mode)
         if (texts.isNotEmpty()) {
             announceText(texts.first())
             return
         }
         
-        // Priority 2: Check for dangerous objects
-        val dangerous = objects.filter { isDangerous(it.label) }
-        val informational = objects.filter { !isDangerous(it.label) }
-        
-        // Always announce dangerous
-        if (dangerous.isNotEmpty()) {
-            announceObjects(dangerous, now, forceAnnounce = true)
+        // ===== For objects, follow same logic as processWithDepth =====
+        val critical = objects.filter { 
+            isCriticalDanger(it.label) && it.confidence > 0.6f 
         }
         
-        // Only announce informational if requested
+        if (critical.isNotEmpty()) {
+            announceObjects(critical, now, forceAnnounce = true, priority = TTSManager.Priority.CRITICAL)
+            return
+        }
+        
+        if (!canAnnounce()) {
+            return
+        }
+        
+        val dangerous = objects.filter { isDangerous(it.label) && !isCriticalDanger(it.label) }
+        val informational = objects.filter { !isDangerous(it.label) }
+        
+        if (dangerous.isNotEmpty()) {
+            announceObjects(dangerous, now, forceAnnounce = false, priority = TTSManager.Priority.HIGH)
+        }
+        
         if (manualAnnounceRequested && informational.isNotEmpty()) {
-            announceObjects(informational, now, forceAnnounce = true)
+            announceObjects(informational, now, forceAnnounce = true, priority = TTSManager.Priority.HIGH)
             manualAnnounceRequested = false
         }
     }
@@ -131,6 +185,12 @@ class DecisionEngine(private val ttsManager: TTSManager) {
     private var lastSpokenText = ""
 
     private fun announceText(text: OCRLine) {
+        // ===== NEW: Check voice state for text reading too =====
+        if (voiceIsListeningForHotword.get()) {
+            Log.d("DecisionEngine", "⏸️ Skipping text - voice listening")
+            return
+        }
+        
         val cleanText = text.text.trim()
         if (cleanText.length < 2) {
             Log.d("DecisionEngine", "Skipping single character: '$cleanText'")
@@ -142,7 +202,7 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         }
 
         val announcement = cleanText.take(50)
-        ttsManager.speak(announcement)
+        ttsManager.speak(announcement, TTSManager.Priority.NORMAL)
     
         lastSpokenText = cleanText
         lastNarrationTime = System.currentTimeMillis()
@@ -153,7 +213,8 @@ class DecisionEngine(private val ttsManager: TTSManager) {
     private fun announceObjectsWithDepth(
         objectsWithDepth: List<CombinedAnalyzer.ObjectWithDepth>, 
         now: Long,
-        forceAnnounce: Boolean = false
+        forceAnnounce: Boolean = false,
+        priority: TTSManager.Priority = TTSManager.Priority.NORMAL
     ) {
         // Clean up old memories
         seenObjects.entries.removeIf { now - it.value > objectMemoryDuration }
@@ -162,14 +223,14 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         val currentLabels = objectsWithDepth.map { it.obj.label }.toSet()
         objectDetectionCount.keys.retainAll(currentLabels)
         
-        for (data in objectsWithDepth.filter { it.obj.confidence > 0.15f }) {
+        for (data in objectsWithDepth.filter { it.obj.confidence > 0.2f }) {  // Raised threshold
             val oldCount = objectDetectionCount[data.obj.label] ?: 0
             objectDetectionCount[data.obj.label] = oldCount + 1
         }
         
         // Find objects ready to announce
         val confirmedObjects = objectsWithDepth
-            .filter { it.obj.confidence > 0.15f }
+            .filter { it.obj.confidence > 0.2f }
             .filter { 
                 val count = objectDetectionCount[it.obj.label] ?: 0
                 count >= requiredConsecutiveDetections || forceAnnounce
@@ -180,8 +241,6 @@ class DecisionEngine(private val ttsManager: TTSManager) {
                 lastSeen == null || (now - lastSeen) > objectMemoryDuration || forceAnnounce
             }
         
-        Log.i("DecisionEngine", "Confirmed objects: ${confirmedObjects.size}")
-        
         if (confirmedObjects.isEmpty()) return
         
         // ===== FOR MANUAL REQUEST: Announce top 3 objects =====
@@ -190,7 +249,6 @@ class DecisionEngine(private val ttsManager: TTSManager) {
             val announcement = buildSceneDescription(top3)
             ttsManager.speak(announcement, TTSManager.Priority.HIGH)
             
-            // Mark all as seen
             top3.forEach { seenObjects[it.obj.label] = now }
             manualAnnounceRequested = false
             return
@@ -199,10 +257,10 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         // ===== FOR DANGEROUS OBJECTS: Announce immediately =====
         val timeSinceLastAnnouncement = now - lastObjectNarrationTime
         
-        if (timeSinceLastAnnouncement > objectNarrationCooldown || forceAnnounce) {
+        if (timeSinceLastAnnouncement > objectNarrationCooldown || forceAnnounce || priority == TTSManager.Priority.CRITICAL) {
             val dataToAnnounce = confirmedObjects.first()
-            Log.i("DecisionEngine", "✅ ANNOUNCING: ${dataToAnnounce.obj.label}")
-            announceObjectWithDepthAndPosition(dataToAnnounce, isDangerous(dataToAnnounce.obj.label))
+            Log.i("DecisionEngine", "✅ ANNOUNCING (${priority.name}): ${dataToAnnounce.obj.label}")
+            announceObjectWithDepthAndPosition(dataToAnnounce, priority)
             seenObjects[dataToAnnounce.obj.label] = now
             lastObjectNarrationTime = now
             lastNarrationTime = now
@@ -220,10 +278,8 @@ class DecisionEngine(private val ttsManager: TTSManager) {
                 
                 append("a ${data.obj.label}")
                 
-                // Add position
                 append(" ${data.position}")
                 
-                // Add depth if available and close
                 if (data.depth != null && data.depth < 3.0f) {
                     append(" at ${String.format("%.1f", data.depth)} meters")
                 }
@@ -233,19 +289,16 @@ class DecisionEngine(private val ttsManager: TTSManager) {
     
     private fun announceObjectWithDepthAndPosition(
         data: CombinedAnalyzer.ObjectWithDepth,
-        isDangerous: Boolean
+        priority: TTSManager.Priority
     ) {
         val obj = data.obj
         val depth = data.depth
         val position = data.position
         
-        // ===== URGENT for dangerous objects =====
-        val urgency = if (isDangerous && depth != null && depth < 2.0f) {
-            when {
-                depth < 0.5f -> "Caution! "
-                depth < 1.5f -> "Warning: "
-                else -> ""
-            }
+        val urgency = if (priority == TTSManager.Priority.CRITICAL) {
+            "Caution! "
+        } else if (priority == TTSManager.Priority.HIGH && depth != null && depth < 2.0f) {
+            "Warning: "
         } else ""
         
         val depthStr = if (depth != null) {
@@ -260,8 +313,8 @@ class DecisionEngine(private val ttsManager: TTSManager) {
             append(urgency)
             
             when {
-                obj.confidence > 0.40f -> append("${obj.label} ")
-                obj.confidence > 0.25f -> append("${obj.label} detected ")
+                obj.confidence > 0.50f -> append("${obj.label} ")
+                obj.confidence > 0.30f -> append("${obj.label} detected ")
                 else -> append("Possibly ${obj.label} ")
             }
             
@@ -272,9 +325,6 @@ class DecisionEngine(private val ttsManager: TTSManager) {
             }
         }
         
-        // ===== Use HIGH priority for dangerous objects =====
-        val priority = if (isDangerous) TTSManager.Priority.HIGH else TTSManager.Priority.NORMAL
-        
         Log.i("DecisionEngine", "🔊 ANNOUNCING: '$announcement' (priority: ${priority.name})")
         ttsManager.speak(announcement, priority)
     }
@@ -282,20 +332,21 @@ class DecisionEngine(private val ttsManager: TTSManager) {
     private fun announceObjects(
         objects: List<DetectedObject>, 
         now: Long,
-        forceAnnounce: Boolean = false
+        forceAnnounce: Boolean = false,
+        priority: TTSManager.Priority = TTSManager.Priority.NORMAL
     ) {
         seenObjects.entries.removeIf { now - it.value > objectMemoryDuration }
         
         val currentLabels = objects.map { it.label }.toSet()
         objectDetectionCount.keys.retainAll(currentLabels)
         
-        for (obj in objects.filter { it.confidence > 0.15f }) {
+        for (obj in objects.filter { it.confidence > 0.2f }) {
             val oldCount = objectDetectionCount[obj.label] ?: 0
             objectDetectionCount[obj.label] = oldCount + 1
         }
         
         val confirmedObjects = objects
-            .filter { it.confidence > 0.15f }
+            .filter { it.confidence > 0.2f }
             .filter { 
                 val count = objectDetectionCount[it.label] ?: 0
                 count >= requiredConsecutiveDetections || forceAnnounce
@@ -308,7 +359,6 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         
         if (confirmedObjects.isEmpty()) return
         
-        // Manual request - announce multiple
         if (forceAnnounce && manualAnnounceRequested) {
             val top3 = confirmedObjects.take(3)
             val announcement = buildString {
@@ -327,9 +377,9 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         
         val timeSinceLastAnnouncement = now - lastObjectNarrationTime
         
-        if (timeSinceLastAnnouncement > objectNarrationCooldown || forceAnnounce) {
+        if (timeSinceLastAnnouncement > objectNarrationCooldown || forceAnnounce || priority == TTSManager.Priority.CRITICAL) {
             val objToAnnounce = confirmedObjects.first()
-            announceObjectSimple(objToAnnounce, isDangerous(objToAnnounce.label))
+            announceObjectSimple(objToAnnounce, priority)
             seenObjects[objToAnnounce.label] = now
             lastObjectNarrationTime = now
             lastNarrationTime = now
@@ -338,16 +388,16 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         }
     }
     
-    private fun announceObjectSimple(obj: DetectedObject, isDangerous: Boolean) {
-        val announcement = when {
-            obj.confidence > 0.40f -> "${obj.label} detected"
-            obj.confidence > 0.25f -> "${obj.label} ahead"
+    private fun announceObjectSimple(obj: DetectedObject, priority: TTSManager.Priority) {
+        val urgency = if (priority == TTSManager.Priority.CRITICAL) "Caution! " else ""
+        
+        val announcement = urgency + when {
+            obj.confidence > 0.50f -> "${obj.label} detected"
+            obj.confidence > 0.30f -> "${obj.label} ahead"
             else -> "Possibly a ${obj.label}"
         }
         
-        val priority = if (isDangerous) TTSManager.Priority.HIGH else TTSManager.Priority.NORMAL
-        
-        Log.i("DecisionEngine", "🔊 ANNOUNCING: '$announcement' (no depth, priority: ${priority.name})")
+        Log.i("DecisionEngine", "🔊 ANNOUNCING: '$announcement' (priority: ${priority.name})")
         ttsManager.speak(announcement, priority)
     }
     
@@ -381,6 +431,7 @@ class DecisionEngine(private val ttsManager: TTSManager) {
         lastNarrationTime = 0L
         lastObjectNarrationTime = 0L
         manualAnnounceRequested = false
+        voiceIsListeningForHotword.set(false)
         Log.i("DecisionEngine", "Engine reset")
     }
 }

@@ -9,6 +9,7 @@ import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.support.common.FileUtil
+import com.example.narratorapp.utils.ImageUtils
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.max
@@ -66,7 +67,7 @@ class ObjectDetector(context: Context) {
                     setUseNNAPI(true)
                 }
                 
-                setAllowFp16PrecisionForFp32(true)
+                // setAllowFp16PrecisionForFp32(true)
             }
             
             interpreter = Interpreter(modelBuffer, options)
@@ -74,10 +75,9 @@ class ObjectDetector(context: Context) {
             val inputTensor = interpreter!!.getInputTensor(0)
             val outputTensor = interpreter!!.getOutputTensor(0)
             
-            val inputBufferSize = inputSize * inputSize * 3 * 4
-            inputBuffer = ByteBuffer.allocateDirect(inputBufferSize).apply {
-                order(ByteOrder.nativeOrder())
-            }
+            // val inputBufferSize = inputSize * inputSize * 3 * 4
+            inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4)
+            inputBuffer.order(ByteOrder.nativeOrder())
             
             val outputShape = outputTensor.shape()
             outputBuffer = Array(outputShape[0]) {
@@ -103,7 +103,7 @@ class ObjectDetector(context: Context) {
             resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
             
             inputBuffer.rewind()
-            bitmapToByteBuffer(resizedBitmap, inputBuffer)
+            ImageUtils.bitmapToByteBuffer(bitmap, inputSize, inputBuffer)
 
             val startTime = SystemClock.uptimeMillis()
             interpreter!!.run(inputBuffer, outputBuffer)
@@ -142,18 +142,18 @@ class ObjectDetector(context: Context) {
 
         // ===== TRY OPTION 1 FIRST: Simple [0,1] normalization =====
         // Most YOLO models use this (YOLOv5, YOLOv8, etc.)
-        // for (pixel in intValues) {
-        //     val r = ((pixel shr 16) and 0xFF) / 255.0f
-        //     val g = ((pixel shr 8) and 0xFF) / 255.0f
-        //     val b = (pixel and 0xFF) / 255.0f
+        for (pixel in intValues) {
+            val r = ((pixel shr 16) and 0xFF) / 255.0f
+            val g = ((pixel shr 8) and 0xFF) / 255.0f
+            val b = (pixel and 0xFF) / 255.0f
             
-        //     // IMPORTANT: YOLO expects RGB order
-        //     buffer.putFloat(r)
-        //     buffer.putFloat(g)
-        //     buffer.putFloat(b)
-        // }
+            // IMPORTANT: YOLO expects RGB order
+            buffer.putFloat(r)
+            buffer.putFloat(g)
+            buffer.putFloat(b)
+        }
         
-        // ===== IF OPTION 1 DOESN'T WORK, TRY OPTION 2: ImageNet normalization =====
+        /* ===== IF OPTION 1 DOESN'T WORK, TRY OPTION 2: ImageNet normalization =====
         // But with CORRECT channel assignments!
         val MEAN_R = 123.675f
         val MEAN_G = 116.28f
@@ -168,12 +168,11 @@ class ObjectDetector(context: Context) {
             val b = (pixel and 0xFF).toFloat()
 
             // ✅ FIXED: Correct channel-to-std mapping
-            buffer.putFloat((b - MEAN_B) / STD_B)  // B with B std
-            buffer.putFloat((g - MEAN_G) / STD_G)  // G with G std
             buffer.putFloat((r - MEAN_R) / STD_R)  // R with R std
-            
+            buffer.putFloat((g - MEAN_G) / STD_G)  // G with G std
+            buffer.putFloat((b - MEAN_B) / STD_B)  // B with B std
         }
-        
+        */
         
         /* ===== IF OPTION 2 DOESN'T WORK, TRY OPTION 3: [-1,1] normalization =====
         for (pixel in intValues) {
